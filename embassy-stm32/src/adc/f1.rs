@@ -136,6 +136,7 @@ impl<'d, T: Instance> Adc<'d, T> {
 
         // Configure the channel to sample
         T::regs().sqr3().write(|reg| reg.set_sq(0, channel.channel()));
+        blocking_delay_us((1_000_000 * 2) / Self::freq().0 as u64 + 1);
         self.convert().await
     }
 
