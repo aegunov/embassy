@@ -10,6 +10,7 @@ pub mod dma;
 pub mod gpio;
 
 pub mod adc;
+pub mod cdog;
 pub mod clkout;
 pub mod config;
 pub mod crc;
@@ -468,7 +469,7 @@ pub fn init(cfg: crate::config::Config) -> Peripherals {
     crate::clocks::init(cfg.clock_cfg).unwrap();
 
     // Initialize embassy-time global driver backed by OSTIMER0
-    // NOTE: As early as possible, but MUST be before clocks!
+    // NOTE: As early as possible, but MUST be AFTER clocks!
     crate::ostimer::init(cfg.time_interrupt_priority);
 
     unsafe {
