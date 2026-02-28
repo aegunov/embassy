@@ -12,28 +12,26 @@ use crate::clocks::{ClockError, Gate, PoweredClock, WakeGuard, enable_and_reset}
 use crate::dma::DmaRequest;
 use crate::gpio::{AnyPin, SealedPin};
 use crate::interrupt::typelevel::Interrupt;
-use crate::interrupt::{self};
 use crate::pac::lpuart::vals::{
     Idlecfg as IdleConfig, Ilt as IdleType, M as DataBits, Msbf as MsbFirst, Pt as Parity, Rst, Rxflush,
     Sbns as StopBits, Swap, Tc, Tdre, Txctsc as TxCtsConfig, Txctssrc as TxCtsSource, Txflush,
 };
-use crate::pac::{self};
+use crate::{interrupt, pac};
 
+mod bbq;
 mod blocking;
 mod buffered;
 mod dma;
 
+pub use bbq::{
+    BbqConfig, BbqError, BbqHalfParts, BbqInterruptHandler, BbqParts, BbqRxMode, LpuartBbq, LpuartBbqRx, LpuartBbqTx,
+};
 pub use blocking::Blocking;
 pub use buffered::{Buffered, BufferedInterruptHandler};
 pub use dma::{Dma, RingBufferedLpuartRx};
 
 mod sealed {
     pub trait Sealed {}
-}
-
-trait SealedInstance {
-    fn info() -> &'static Info;
-    fn state() -> &'static State;
 }
 
 struct State {
@@ -118,17 +116,21 @@ impl Info {
     }
 }
 
-/// Trait for LPUART peripheral instances
-#[allow(private_bounds)]
-pub trait Instance: SealedInstance + PeripheralType + 'static + Send + Gate<MrccPeriphConfig = LpuartConfig> {
+trait SealedInstance: Gate<MrccPeriphConfig = LpuartConfig> {
+    fn info() -> &'static Info;
+    fn state() -> &'static State;
+
     const CLOCK_INSTANCE: crate::clocks::periph_helpers::LpuartInstance;
-    type Interrupt: interrupt::typelevel::Interrupt;
-    /// Type-safe DMA request source for TX
-    type TxDmaRequest: DmaRequest;
-    /// Type-safe DMA request source for RX
-    type RxDmaRequest: DmaRequest;
+    const TX_DMA_REQUEST: DmaRequest;
+    const RX_DMA_REQUEST: DmaRequest;
     const PERF_INT_INCR: fn();
     const PERF_INT_WAKE_INCR: fn();
+}
+
+/// Trait for LPUART peripheral instances
+#[allow(private_bounds)]
+pub trait Instance: SealedInstance + PeripheralType + 'static + Send {
+    type Interrupt: interrupt::typelevel::Interrupt;
 }
 
 macro_rules! impl_instance {
@@ -149,16 +151,18 @@ macro_rules! impl_instance {
                         static STATE: State = State::new();
                         &STATE
                     }
+
+                    const CLOCK_INSTANCE: crate::clocks::periph_helpers::LpuartInstance
+                        = crate::clocks::periph_helpers::LpuartInstance::[<Lpuart $n>];
+                    const TX_DMA_REQUEST: DmaRequest = DmaRequest::[<LPUART $n Tx>];
+                    const RX_DMA_REQUEST: DmaRequest = DmaRequest::[<LPUART $n Rx>];
+                    const PERF_INT_INCR: fn() = crate::perf_counters::[<incr_interrupt_lpuart $n>];
+                    const PERF_INT_WAKE_INCR: fn() = crate::perf_counters::[<incr_interrupt_lpuart $n _wake>];
                 }
 
                 impl Instance for crate::peripherals::[<LPUART $n>] {
-                    const CLOCK_INSTANCE: crate::clocks::periph_helpers::LpuartInstance
-                        = crate::clocks::periph_helpers::LpuartInstance::[<Lpuart $n>];
                     type Interrupt = crate::interrupt::typelevel::[<LPUART $n>];
-                    type TxDmaRequest = crate::dma::[<Lpuart $n TxRequest>];
-                    type RxDmaRequest = crate::dma::[<Lpuart $n RxRequest>];
-                    const PERF_INT_INCR: fn() = crate::perf_counters::[<incr_interrupt_lpuart $n>];
-                    const PERF_INT_WAKE_INCR: fn() = crate::perf_counters::[<incr_interrupt_lpuart $n _wake>];
+
                 }
             }
         )*
@@ -414,21 +418,25 @@ fn has_rx_data_pending(info: &'static Info) -> bool {
 impl<T: SealedPin> sealed::Sealed for T {}
 
 pub trait TxPin<T: Instance>: Into<AnyPin> + sealed::Sealed + PeripheralType {
+    const MUX: crate::pac::port::vals::Mux;
     /// convert the pin to appropriate function for Lpuart Tx  usage
     fn as_tx(&self);
 }
 
 pub trait RxPin<T: Instance>: Into<AnyPin> + sealed::Sealed + PeripheralType {
+    const MUX: crate::pac::port::vals::Mux;
     /// convert the pin to appropriate function for Lpuart Rx  usage
     fn as_rx(&self);
 }
 
 pub trait CtsPin<T: Instance>: Into<AnyPin> + sealed::Sealed + PeripheralType {
+    const MUX: crate::pac::port::vals::Mux;
     /// convert the pin to appropriate function for Lpuart Cts usage
     fn as_cts(&self);
 }
 
 pub trait RtsPin<T: Instance>: Into<AnyPin> + sealed::Sealed + PeripheralType {
+    const MUX: crate::pac::port::vals::Mux;
     /// convert the pin to appropriate function for Lpuart Rts usage
     fn as_rts(&self);
 }
@@ -436,11 +444,12 @@ pub trait RtsPin<T: Instance>: Into<AnyPin> + sealed::Sealed + PeripheralType {
 macro_rules! impl_tx_pin {
     ($inst:ident, $pin:ident, $alt:ident) => {
         impl TxPin<crate::peripherals::$inst> for crate::peripherals::$pin {
+            const MUX: crate::pac::port::vals::Mux = crate::pac::port::vals::Mux::$alt;
             fn as_tx(&self) {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast.into());
                 self.set_drive_strength(crate::gpio::DriveStrength::Normal.into());
-                self.set_function(crate::pac::port::vals::Mux::$alt);
+                self.set_function(<Self as TxPin<crate::peripherals::$inst>>::MUX);
                 self.set_enable_input_buffer(false);
             }
         }
@@ -450,9 +459,10 @@ macro_rules! impl_tx_pin {
 macro_rules! impl_rx_pin {
     ($inst:ident, $pin:ident, $alt:ident) => {
         impl RxPin<crate::peripherals::$inst> for crate::peripherals::$pin {
+            const MUX: crate::pac::port::vals::Mux = crate::pac::port::vals::Mux::$alt;
             fn as_rx(&self) {
                 self.set_pull(crate::gpio::Pull::Disabled);
-                self.set_function(crate::pac::port::vals::Mux::$alt);
+                self.set_function(<Self as RxPin<crate::peripherals::$inst>>::MUX);
                 self.set_enable_input_buffer(true);
             }
         }
@@ -462,9 +472,10 @@ macro_rules! impl_rx_pin {
 macro_rules! impl_cts_pin {
     ($inst:ident, $pin:ident, $alt:ident) => {
         impl CtsPin<crate::peripherals::$inst> for crate::peripherals::$pin {
+            const MUX: crate::pac::port::vals::Mux = crate::pac::port::vals::Mux::$alt;
             fn as_cts(&self) {
                 self.set_pull(crate::gpio::Pull::Disabled);
-                self.set_function(crate::pac::port::vals::Mux::$alt);
+                self.set_function(<Self as CtsPin<crate::peripherals::$inst>>::MUX);
                 self.set_enable_input_buffer(true);
             }
         }
@@ -474,11 +485,12 @@ macro_rules! impl_cts_pin {
 macro_rules! impl_rts_pin {
     ($inst:ident, $pin:ident, $alt:ident) => {
         impl RtsPin<crate::peripherals::$inst> for crate::peripherals::$pin {
+            const MUX: crate::pac::port::vals::Mux = crate::pac::port::vals::Mux::$alt;
             fn as_rts(&self) {
                 self.set_pull(crate::gpio::Pull::Disabled);
                 self.set_slew_rate(crate::gpio::SlewRate::Fast.into());
                 self.set_drive_strength(crate::gpio::DriveStrength::Normal.into());
-                self.set_function(crate::pac::port::vals::Mux::$alt);
+                self.set_function(<Self as RtsPin<crate::peripherals::$inst>>::MUX);
                 self.set_enable_input_buffer(false);
             }
         }
@@ -731,9 +743,31 @@ struct TxPins<'a> {
     cts_pin: Option<Peri<'a, AnyPin>>,
 }
 
+impl<'a> TxPins<'a> {
+    fn take(self) -> (Peri<'a, AnyPin>, Option<Peri<'a, AnyPin>>) {
+        unsafe {
+            let tx_pin = self.tx_pin.clone_unchecked();
+            let cts_pin = self.cts_pin.as_ref().map(|p| p.clone_unchecked());
+            core::mem::forget(self);
+            (tx_pin, cts_pin)
+        }
+    }
+}
+
 struct RxPins<'a> {
     rx_pin: Peri<'a, AnyPin>,
     rts_pin: Option<Peri<'a, AnyPin>>,
+}
+
+impl<'a> RxPins<'a> {
+    fn take(self) -> (Peri<'a, AnyPin>, Option<Peri<'a, AnyPin>>) {
+        unsafe {
+            let rx_pin = self.rx_pin.clone_unchecked();
+            let rts_pin = self.rts_pin.as_ref().map(|p| p.clone_unchecked());
+            core::mem::forget(self);
+            (rx_pin, rts_pin)
+        }
+    }
 }
 
 impl Drop for TxPins<'_> {
@@ -870,7 +904,7 @@ impl<'a, M: Mode> Lpuart<'a, M> {
         clear_all_status_flags(T::info());
         configure_flow_control(T::info(), enable_tx_cts, enable_rx_rts, &config);
         configure_bit_order(T::info(), config.msb_first);
-        enable_transceiver(T::info(), enable_rx, enable_tx);
+        enable_transceiver(T::info(), enable_tx, enable_rx);
 
         Ok(parts.wake_guard)
     }
